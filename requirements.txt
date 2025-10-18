@@ -1,0 +1,6 @@
+streamlit
+streamlit-option-menu
+pandas
+numpy
+altair
+xlsxwriter

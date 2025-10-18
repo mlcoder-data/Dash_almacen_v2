@@ -1,0 +1,28 @@
+
+/* ======= Global tweaks ======= */
+html, body, [class*="css"]  { font-family: Inter, system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell, "Helvetica Neue", Arial, "Noto Sans", "Apple Color Emoji", "Segoe UI Emoji" !important; }
+
+/* Metric cards */
+div.stMetric { background: #161a22; border: 1px solid #222733; padding: 16px 18px; border-radius: 16px; box-shadow: 0 2px 16px rgba(0,0,0,.25); }
+div.stMetric label { color: #9aa6b2; text-transform: uppercase; letter-spacing: .08em; font-size: .75rem; }
+div.stMetric span { font-weight: 700; font-size: 1.6rem; }
+
+/* Tables */
+[data-testid="stTable"], .stDataFrame { border-radius: 12px; overflow: hidden; box-shadow: 0 1px 16px rgba(0,0,0,.2); }
+
+/* Sidebar */
+section[data-testid="stSidebar"] { background: linear-gradient(180deg, #0f1115 0%, #12151c 100%); border-right: 1px solid #1b1f2a; }
+
+/* Buttons */
+.stButton button { border-radius: 12px; font-weight: 600; padding: .6rem 1rem; }
+.stButton button[kind="secondary"] { background:#1b1f2a; border: 1px solid #2a3142; }
+
+/* Badges */
+.badge { display:inline-flex; align-items:center; gap:.4rem; padding:.25rem .6rem; border-radius:999px; font-size:.8rem; font-weight:600; border:1px solid transparent; }
+.badge.ok { background:#16362a; color:#c8f0d2; border-color:#1e6b46; }
+.badge.warn { background:#3b2a16; color:#ffe2b9; border-color:#7a5322; }
+.badge.danger { background:#3a1e1f; color:#ffd1d4; border-color:#7a2b2f; }
+
+/* Cards */
+.card { background:#161a22; border:1px solid #222733; border-radius:16px; padding:16px; box-shadow: 0 4px 24px rgba(0,0,0,.25); }
+.card h4 { margin:0 0 .5rem 0; }
