@@ -313,7 +313,7 @@ elif menu_key == "registrar":
         normalizar_salon_label,
     )
 
-    st.header("📝 Registrar movimiento de llave")
+    st.header("📝 Registrar Prestamo de Salones")
 
     card(
         "Instrucciones",
