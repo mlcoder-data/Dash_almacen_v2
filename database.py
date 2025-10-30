@@ -3,6 +3,12 @@ import sqlite3
 import pandas as pd
 from pathlib import Path
 
+from database_utils import txn
+from validators import validar_equipo, norm_salon, norm_placa
+from patterns import OK, ERR, Result
+from errors import ValidationError, ConflictError, NotFoundError, IntegrityError
+from validators import normalizar_salon_label, titlecase_nombre
+
 # ---- RUTA ÚNICA Y CONEXIÓN ----
 RUTA_BD = str(Path(__file__).with_name("llaves.db"))
 
@@ -12,7 +18,6 @@ def obtener_conexion():
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON;")
     return conn
-
 
 # ---- ESQUEMA BASE (llaves + inventario) ----
 ESQUEMA_BASE = """
@@ -57,11 +62,16 @@ CREATE INDEX IF NOT EXISTS idx_inv_salon ON inventario(salon);
 """
 
 def ensure_db():
-    """Crea tablas base si no existen."""
+    """Crea tablas base y deja inventario listo (placa + movimientos)."""
     conn = obtener_conexion()
     conn.executescript(ESQUEMA_BASE)
-    conn.commit()
-    conn.close()
+    conn.commit(); conn.close()
+
+    # Extras
+    asegurar_esquema_inventario()
+    asegurar_campo_placa()
+    asegurar_esquema_movimientos()
+
 
 def asegurar_esquema_inventario():
     """Crea tablas/índices adicionales para inventario/rooms si no existen."""
@@ -162,24 +172,36 @@ def obtener_inventario():
     return df
 
 
-def agregar_equipo(nombre, tipo, estado, salon, responsable, fecha_registro):
+def agregar_equipo(nombre, tipo, estado, salon, responsable, fecha_registro, placa=None):
     conn = obtener_conexion()
     conn.execute(
-        "INSERT INTO inventario (nombre, tipo, estado, salon, responsable, fecha_registro) VALUES (?,?,?,?,?,?)",
-        (nombre, tipo, estado, salon, responsable, fecha_registro),
+        """INSERT INTO inventario (nombre, tipo, estado, salon, responsable, fecha_registro, placa)
+           VALUES (?,?,?,?,?,?,?)""",
+        (nombre, tipo, estado, salon, responsable, fecha_registro, placa),
     )
-    conn.commit()
-    conn.close()
+    conn.commit(); conn.close()
+
 
 def actualizar_equipo(id_equipo: int, **campos):
     if not campos:
         return
+    # validar placa única si viene en la actualización
+    if "placa" in campos and campos["placa"]:
+        conn = obtener_conexion()
+        row = conn.execute(
+            "SELECT id FROM inventario WHERE placa=? AND id<>?",
+            (campos["placa"], int(id_equipo))
+        ).fetchone()
+        conn.close()
+        if row:
+            raise ValueError(f"La placa {campos['placa']} ya existe en otro equipo.")
+
     sets = ", ".join([f"{k}=?" for k in campos.keys()])
     valores = list(campos.values()) + [id_equipo]
     conn = obtener_conexion()
     conn.execute(f"UPDATE inventario SET {sets} WHERE id=?", valores)
-    conn.commit()
-    conn.close()
+    conn.commit(); conn.close()
+
 
 def eliminar_equipo(id_equipo: int):
     conn = obtener_conexion()
@@ -313,43 +335,31 @@ def registrar_movimiento_equipo(inventario_id:int, placa:str, salon_origen:str, 
 
 def mover_equipo(inventario_id:int, nuevo_salon:str, motivo:str, responsable:str,
                  fecha_hora:str, notas:str=None):
-    """
-    Actualiza el salón del equipo y registra el movimiento (con origen/destino).
-    Si el equipo tiene 'placa', se guarda en el movimiento.
-    """
     conn = obtener_conexion()
     cur = conn.cursor()
 
-    # Datos actuales del equipo
-    cur.execute("SELECT id, salon, placa FROM inventario WHERE id=?", (int(inventario_id),))
-    row = cur.fetchone()
-    if not row:
-        conn.close()
-        raise ValueError(f"Equipo id={inventario_id} no existe")
+    with txn(conn):
+        # Datos actuales
+        cur.execute("SELECT id, salon, placa FROM inventario WHERE id=?", (int(inventario_id),))
+        row = cur.fetchone()
+        if not row:
+            raise ValueError(f"Equipo id={inventario_id} no existe")
 
-    salon_origen = (row["salon"] or "").strip().upper()
-    placa_actual = (row["placa"] or None)
+        salon_origen = (row["salon"] or "").strip().upper()
+        placa_actual = (row["placa"] or None)
+        nuevo_salon_up = (nuevo_salon or "").strip().upper()
 
-    # Actualiza inventario
-    nuevo_salon_up = (nuevo_salon or "").strip().upper()
-    cur.execute("UPDATE inventario SET salon=? WHERE id=?", (nuevo_salon_up, int(inventario_id)))
+        # Update inventario
+        cur.execute("UPDATE inventario SET salon=? WHERE id=?", (nuevo_salon_up, int(inventario_id)))
 
-    # Log movimiento
-    cur.execute(
-        """INSERT INTO inventario_movs
-           (inventario_id, placa, salon_origen, salon_destino, motivo, responsable, fecha_hora, notas)
-           VALUES (?,?,?,?,?,?,?,?)""",
-        (int(inventario_id),
-         placa_actual,
-         salon_origen or None,
-         nuevo_salon_up or None,
-         (motivo or None),
-         (responsable or None),
-         fecha_hora,
-         (notas or None))
-    )
-
-    conn.commit(); conn.close()
+        # Log movimiento
+        cur.execute(
+            """INSERT INTO inventario_movs
+               (inventario_id, placa, salon_origen, salon_destino, motivo, responsable, fecha_hora, notas)
+               VALUES (?,?,?,?,?,?,?,?)""",
+            (int(inventario_id), placa_actual, salon_origen or None, nuevo_salon_up or None,
+             (motivo or None), (responsable or None), fecha_hora, (notas or None))
+        )
 
 def obtener_movimientos(fecha_ini:str=None, fecha_fin:str=None, placa:str=None,
                         salon_origen:str=None, salon_destino:str=None, responsable:str=None):
@@ -381,3 +391,198 @@ def obtener_movimientos(fecha_ini:str=None, fecha_fin:str=None, placa:str=None,
 
 def movimientos_por_placa(placa:str):
     return obtener_movimientos(placa=(placa or "").strip().upper())
+
+# --- SAFE WRAPPERS (usan validators + Result + txn) ---
+def agregar_equipo_safe(nombre, tipo, estado, salon, responsable, fecha_registro, placa=None) -> Result:
+    try:
+        nombre, tipo, estado = validar_equipo(nombre, tipo, estado)
+        salon = norm_salon(salon)
+        placa = norm_placa(placa)
+
+        if placa and existe_placa(placa):
+            return ERR(f"La placa {placa} ya existe.")
+
+        conn = obtener_conexion()
+        with txn(conn):
+            if salon != "BODEGA":
+                conn.execute("INSERT OR IGNORE INTO rooms(codigo) VALUES (?)", (salon,))
+            conn.execute(
+                """INSERT INTO inventario (nombre, tipo, estado, salon, responsable, fecha_registro, placa)
+                   VALUES (?,?,?,?,?,?,?)""",
+                (nombre, tipo, estado, salon, (responsable or ""), fecha_registro, placa),
+            )
+        return OK(True)
+    except ValidationError as e:
+        return ERR(str(e))
+    except IntegrityError as e:
+        return ERR("Violación de unicidad (placa).")
+    except Exception as e:
+        return ERR(f"Error al agregar equipo: {e}")
+
+def actualizar_equipo_safe(id_equipo:int, **campos) -> Result:
+    try:
+        if "salon" in campos and campos["salon"]:
+            campos["salon"] = norm_salon(campos["salon"])
+        if "placa" in campos:
+            p = norm_placa(campos["placa"])
+            campos["placa"] = p
+            if p:
+                conn = obtener_conexion()
+                row = conn.execute(
+                    "SELECT id FROM inventario WHERE placa=? AND id<>?", (p, int(id_equipo))
+                ).fetchone()
+                conn.close()
+                if row:
+                    return ERR(f"La placa {p} ya existe en otro equipo.")
+
+        actualizar_equipo(id_equipo, **campos)
+        return OK(True)
+    except Exception as e:
+        return ERR(f"Error al actualizar: {e}")
+
+def eliminar_equipo_safe(id_equipo:int) -> Result:
+    try:
+        eliminar_equipo(id_equipo)
+        return OK(True)
+    except Exception as e:
+        return ERR(f"Error al eliminar: {e}")
+
+def insertar_inventario_masivo_safe(df: pd.DataFrame) -> Result:
+    try:
+        # normaliza columnas clave
+        for c in ["nombre","tipo","estado","salon","responsable","fecha_registro"]:
+            if c not in df.columns:
+                return ERR(f"Falta columna obligatoria: {c}")
+
+        # limpieza básica
+        for c in df.columns:
+            if df[c].dtype == object:
+                df[c] = df[c].astype(str).str.strip()
+        df["tipo"]   = df["tipo"].str.title()
+        df["estado"] = df["estado"].str.title()
+        df["salon"]  = df["salon"].str.upper().fillna("")
+        if "placa" in df.columns:
+            df["placa"] = df["placa"].fillna("").str.upper().replace({"": None})
+        else:
+            df["placa"] = None
+
+        cant = insertar_inventario_masivo(df)
+        return OK(cant)
+    except Exception as e:
+        return ERR(f"Error en carga masiva: {e}")
+
+def mover_equipo_safe(inventario_id:int, nuevo_salon:str, motivo:str, responsable:str,
+                      fecha_hora:str, notas:str=None) -> Result:
+    try:
+        nuevo_salon = norm_salon(nuevo_salon)
+        mover_equipo(inventario_id, nuevo_salon, motivo, responsable, fecha_hora, notas)
+        return OK(True)
+    except Exception as e:
+        return ERR(f"Error al mover equipo: {e}")
+
+from patterns import Result, OK, ERR
+from validators import validar_equipo, norm_salon, norm_placa
+
+def agregar_equipo_safe(nombre, tipo, estado, salon, responsable, fecha_registro, placa=None) -> Result:
+    # Validaciones de dominio
+    err = validar_equipo(nombre, tipo, estado, salon, fecha_registro)
+    if err: return ERR(err)
+
+    salon_n = norm_salon(salon)
+    placa_n = norm_placa(placa)
+
+    # Unicidad de placa (si viene)
+    if placa_n and existe_placa(placa_n):
+        return ERR(f"La placa {placa_n} ya existe.")
+
+    try:
+        conn = obtener_conexion()
+        with txn(conn):
+            # asegurar salón si no existe
+            registrar_salon(salon_n)
+            # insertar
+            conn.execute(
+                """INSERT INTO inventario (nombre, tipo, estado, salon, responsable, fecha_registro, placa)
+                   VALUES (?,?,?,?,?,?,?)""",
+                (nombre.strip(), tipo.strip().title(), estado.strip(), salon_n,
+                 (responsable or "").strip(), fecha_registro, placa_n),
+            )
+        conn.close()
+        return OK()
+    except Exception as e:
+        try: conn.close()
+        except: pass
+        return ERR(f"Error guardando equipo: {e}")
+
+def mover_equipo_safe(inventario_id:int, salon_destino:str, motivo:str, responsable:str, fecha_hora:str, notas:str|None=None) -> Result:
+    try:
+        conn = obtener_conexion()
+        with txn(conn):
+            # leer actual
+            row = conn.execute("SELECT id, salon, placa FROM inventario WHERE id=?", (int(inventario_id),)).fetchone()
+            if not row: return ERR(f"Equipo id={inventario_id} no existe")
+
+            origen = (row["salon"] or "").strip().upper()
+            destino = norm_salon(salon_destino)
+
+            registrar_salon(destino)
+
+            conn.execute("UPDATE inventario SET salon=? WHERE id=?", (destino, int(inventario_id)))
+            conn.execute(
+                """INSERT INTO inventario_movs (inventario_id, placa, salon_origen, salon_destino, motivo, responsable, fecha_hora, notas)
+                   VALUES (?,?,?,?,?,?,?,?)""",
+                (int(inventario_id), (row["placa"] or None), origen or None, destino or None,
+                 (motivo or None), (responsable or None), fecha_hora, (notas or None))
+            )
+        conn.close()
+        return OK()
+    except Exception as e:
+        try: conn.close()
+        except: pass
+        return ERR(f"Error moviendo equipo: {e}")
+
+# database.py
+from validators import normalizar_salon_label, titlecase_nombre
+
+def _get_db_version(conn) -> int:
+    return conn.execute("PRAGMA user_version").fetchone()[0]
+
+def _set_db_version(conn, v: int) -> None:
+    conn.execute(f"PRAGMA user_version = {v}")
+
+def _migration_1_normalize_data(conn):
+    """Normaliza salones y nombres ya existentes."""
+    cur = conn.cursor()
+
+    # llaves: normalizar salón
+    for _id, salon in cur.execute("SELECT id, salon FROM llaves").fetchall():
+        new = normalizar_salon_label(salon or "")
+        if new and new != (salon or ""):
+            cur.execute("UPDATE llaves SET salon=? WHERE id=?", (new, _id))
+
+    # llaves: normalizar nombre
+    for _id, nombre in cur.execute("SELECT id, nombre FROM llaves").fetchall():
+        new = titlecase_nombre(nombre or "")
+        if new and new != (nombre or ""):
+            cur.execute("UPDATE llaves SET nombre=? WHERE id=?", (new, _id))
+
+    # inventario: normalizar salón
+    for _id, salon in cur.execute("SELECT id, salon FROM inventario").fetchall():
+        new = normalizar_salon_label(salon or "")
+        if new and new != (salon or ""):
+            cur.execute("UPDATE inventario SET salon=? WHERE id=?", (new, _id))
+
+def run_startup_migrations():
+    """
+    Ejecuta migraciones pendientes UNA sola vez, controlado por user_version.
+    - v0 -> v1: normalización de salones y nombres existentes
+    """
+    conn = obtener_conexion()
+    try:
+        ver = _get_db_version(conn)
+        if ver < 1:
+            _migration_1_normalize_data(conn)
+            _set_db_version(conn, 1)
+            conn.commit()
+    finally:
+        conn.close()

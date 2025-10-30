@@ -2,21 +2,75 @@
 import streamlit as st
 import pandas as pd
 from datetime import datetime
- # si no lo tienes importado
+from services.inventario import agregar_equipo_safe
+from services.movimientos import mover_equipo_safe
+from ui_helpers import ui_result
+from database import ensure_db, asegurar_esquema_inventario, asegurar_campo_placa, asegurar_esquema_movimientos
+ensure_db()
+asegurar_esquema_inventario()
+asegurar_campo_placa()
+asegurar_esquema_movimientos()
+
+
 from streamlit_option_menu import option_menu  # menú con iconos
 from auth import login  # maneja sesión y roles en st.session_state
 # BD y helpers tuyos
+from database import agregar_equipo_safe
 
-# importa funciones de la BD
+# BD y helpers que ya tienes
 from database import (
-    ensure_db,                   # crea tablas base (llaves, inventario)
-    asegurar_esquema_inventario, # crea rooms + índices extra (opcional, al entrar a Inventario)
-    registrar_evento, obtener_historial, eliminar_registro, llave_activa_por_salon,
-    obtener_inventario, agregar_equipo, actualizar_equipo, eliminar_equipo,
+    ensure_db, asegurar_esquema_inventario, registrar_evento,
+    obtener_historial, eliminar_registro, llave_activa_por_salon,
+    obtener_inventario, actualizar_equipo, eliminar_equipo,
     obtener_salones, registrar_salon, insertar_inventario_masivo,
 )
 
+
 ensure_db()
+
+from database import ensure_db, asegurar_esquema_inventario, asegurar_campo_placa, run_startup_migrations
+
+
+import re
+
+# Lista base de programas (el selectbox de Streamlit tiene búsqueda por tipeo)
+PROGRAMAS_BASE = [
+    "Electrónica",
+    "ADSO",
+    "Multimedia"
+    "Redes",
+    "Teleco",
+    "Otro…",
+]
+
+def _normalize_spaces(s: str) -> str:
+    return re.sub(r"\s+", " ", (s or "").strip())
+
+def titlecase_nombre(nombre: str) -> str:
+    """
+    Pone la primera letra de cada palabra en mayúscula,
+    respetando conectores comunes.
+    """
+    conectores = {"de", "del", "la", "las", "los", "y"}
+    parts = _normalize_spaces(nombre).lower().split(" ")
+    cap = [p if p in conectores else p.capitalize() for p in parts if p]
+    return " ".join(cap)
+
+def validar_nombre_instructor(nombre: str):
+    """
+    - No permite números
+    - Solo letras (incluye acentos), espacios y ,.'-
+    - No vacío
+    """
+    if not nombre or not _normalize_spaces(nombre):
+        return False, "El nombre no puede estar vacío."
+    if any(ch.isdigit() for ch in nombre):
+        return False, "El nombre no debe contener números."
+    patron = r"^[A-Za-zÁÉÍÓÚÜÑáéíóúüñ\s\.\'\-]+$"
+    if not re.match(patron, nombre):
+        return False, "Usa solo letras, espacios y los caracteres . ' -"
+    return True, ""
+
 
 CATEGORIAS_VALIDAS = [
     "Computador","Portátil","Cargador","Osciloscopio","Multímetro","Fuente","Router",
@@ -36,7 +90,6 @@ def load_styles():
 
 st.set_page_config(page_title="Almacén-TICS", layout="wide")
 load_styles()
-
 
 # ---------------------- Autenticación ----------------------
 #if not login():
@@ -253,64 +306,194 @@ if menu_key == "dashboard":
 
 
 elif menu_key == "registrar":
+    from validators import (
+        validar_nombre_instructor,
+        titlecase_nombre,
+        _normalize_spaces,
+        normalizar_salon_label,
+    )
+
     st.header("📝 Registrar movimiento de llave")
-    card("Instrucciones", "Completa los campos y registra **Entregada** o **Devuelta**.  \n"
-                          + badge("Una llave no puede entregarse dos veces seguidas", "warn"))
+
+    card(
+        "Instrucciones",
+        "Completa los campos y registra **Entregada** o **Devuelta**.  \n"
+        + badge("Una llave no puede entregarse dos veces seguidas", "warn")
+    )
+
+    # Fuente de programas (permite que crezcan por sesión)
+    if "programas" not in st.session_state:
+        st.session_state.programas = PROGRAMAS_BASE.copy()
+
     with st.form("form_llave", clear_on_submit=True):
-        c1,c2 = st.columns(2)
+        c1, c2 = st.columns(2)
         with c1:
-            nombre = st.text_input("Instructor *")
-            area = st.text_input("Programa *")
+            # Nombre con validación estricta (sin números)
+            nombre_raw = st.text_input("Instructor *", key="reg_nombre", placeholder="Ej: Ana María Pérez")
+
+            # Programa con autocompletado
+            programa_sel = st.selectbox("Programa *", options=st.session_state.programas, key="reg_programa")
         with c2:
-            salon = st.text_input("Salón *", placeholder="Ej: C3-204")
-            accion = st.selectbox("Acción *", ["Entregada", "Devuelta"])
-        if st.form_submit_button("Registrar", type="primary"):
-            if not nombre or not area or not salon or not accion:
-                st.error("Completa los campos obligatorios (*)")
+            salon_raw = st.text_input("Salón *", placeholder="Ej: Sala 7 / 316-F / Bodega", key="reg_salon")
+            accion = st.selectbox("Acción *", ["Entregada", "Devuelta"], key="reg_accion")
+
+        # Si el usuario escoge "Otro…", pedimos el nombre del programa
+        otro_programa = None
+        if programa_sel == "Otro…":
+            otro_programa = st.text_input("Escribe el nombre del programa", key="reg_programa_otro")
+
+        # Botón de envío
+        if st.form_submit_button("Registrar", type="primary", use_container_width=False):
+
+            # --- Validaciones y normalizaciones ---
+            ok, msg = validar_nombre_instructor(nombre_raw)
+            if not ok:
+                st.error(msg)
+                st.stop()
+
+            nombre_fmt = titlecase_nombre(nombre_raw)
+            salon = normalizar_salon_label(salon_raw)
+            if not salon:
+                st.error("Indica un salón válido.")
+                st.stop()
+
+            # Programa final (si escribió “Otro…”)
+            if programa_sel == "Otro…":
+                p = _normalize_spaces(otro_programa or "")
+                if not p:
+                    st.error("Escribe el nombre del programa.")
+                    st.stop()
+                p_fmt = titlecase_nombre(p)
+                if p_fmt not in st.session_state.programas:
+                    st.session_state.programas.insert(-1, p_fmt)  # antes de “Otro…”
+                programa_final = p_fmt
             else:
-                if accion == "Entregada" and llave_activa_por_salon(salon):
-                    st.error(f"La llave del salón {salon} ya está prestada. Primero debe devolverse.")
-                else:
-                    registrar_evento(nombre, area, salon, accion, now_str())
-                    b = badge("OK", "ok") if accion=="Devuelta" else badge("Entregada","warn")
-                    card("Registro exitoso", f"{b}  \n**{accion}** para **{salon}** — **{nombre}** ({area})  \n🕒 {now_str()}")
-                    st.rerun()
+                programa_final = programa_sel
+
+            # --- Reglas de negocio ---
+            if accion == "Entregada" and llave_activa_por_salon(salon):
+                st.error(f"La llave del salón {salon} ya está prestada. Primero debe devolverse.")
+                st.stop()
+
+            # --- Guardado ---
+            registrar_evento(
+                nombre_fmt,
+                programa_final,
+                salon,
+                accion,
+                now_str()
+            )
+
+            b = badge("OK", "ok") if accion == "Devuelta" else badge("Entregada", "warn")
+            card(
+                "Registro exitoso",
+                f"{b}  \n**{accion}** para **{salon}** — **{nombre_fmt}** ({programa_final})  \n🕒 {now_str()}"
+            )
+            st.rerun()
 
 elif menu_key == "activas":
+    import pandas as pd
+    from database import obtener_historial, registrar_evento
+    from validators import normalizar_salon_label
+
     st.header("🔐 Llaves actualmente entregadas")
+
+    # --- Datos base
     data = obtener_historial()
+    st.caption(f"Registros en historial: **{0 if data is None else len(data)}**")
+
     if data is None or data.empty:
         card("Estado", badge("No hay llaves prestadas", "ok"))
+        st.stop()
+
+    # Copia defensiva + columnas esperadas
+    df = data.copy()
+    for col in ["nombre", "area", "salon", "accion", "fecha_hora", "id"]:
+        if col not in df.columns:
+            df[col] = None
+
+    # Normaliza fecha
+    df["fecha_hora"] = pd.to_datetime(df["fecha_hora"], errors="coerce")
+
+    # Filtra filas válidas
+    df = df[df["salon"].notna() & df["accion"].notna()]
+    if df.empty:
+        card("Estado", badge("No hay llaves prestadas", "ok"))
+        st.stop()
+
+    # Último movimiento por salón
+    df_sorted = df.sort_values("fecha_hora", na_position="last")
+    ult = df_sorted.groupby("salon", as_index=False).tail(1)
+    activas = ult[ult["accion"].str.upper() == "ENTREGADA"].copy()
+
+    st.caption(f"Salones con llave activa: **{len(activas)}**")
+    if activas.empty:
+        card("Estado", badge("No hay llaves prestadas", "ok"))
+        st.stop()
+
+    # --- Filtros (opcionales)
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        f_prof = st.selectbox(
+            "Profesor (opcional)",
+            ["Todos"] + sorted(activas["nombre"].dropna().unique().tolist()),
+            key="act_f_prof",
+        )
+    with c2:
+        f_area = st.selectbox(
+            "Programa (opcional)",
+            ["Todos"] + sorted(activas["area"].dropna().unique().tolist()),
+            key="act_f_area",
+        )
+    with c3:
+        f_salon = st.selectbox(
+            "Salón (opcional)",
+            ["Todos"] + sorted(activas["salon"].dropna().unique().tolist()),
+            key="act_f_salon",
+        )
+    with c4:
+        # campo libre opcional (normalizado si se escribe)
+        salon_raw = st.text_input("Buscar por texto (salón)", placeholder="Ej: Sala 7 / 303-F / Bodega")
+        salon_txt = normalizar_salon_label(salon_raw) if salon_raw.strip() else None
+
+    # Aplica filtros
+    df_view = activas.copy()
+    if f_prof != "Todos":
+        df_view = df_view[df_view["nombre"] == f_prof]
+    if f_area != "Todos":
+        df_view = df_view[df_view["area"] == f_area]
+    if f_salon != "Todos":
+        df_view = df_view[df_view["salon"] == f_salon]
+    if salon_txt:
+        df_view = df_view[df_view["salon"] == salon_txt]
+
+    if df_view.empty:
+        card("Resultado", badge("Sin coincidencias con los filtros", "warn"))
     else:
-        df = procesar_fechas(data)
-        ult = df.sort_values("fecha_hora").groupby("salon").tail(1)
-        activas = ult[ult["accion"] == "Entregada"].copy()
+        # Render tarjetas + botón devolver (key única por ID)
+        for _, r in df_view.sort_values("fecha_hora", ascending=False).iterrows():
+            fh = r["fecha_hora"]
+            fh_txt = fh.strftime("%Y-%m-%d %H:%M") if pd.notna(fh) else "—"
+            estado = badge("Entregada", "warn")
 
-        if activas.empty:
-            card("Estado", badge("No hay llaves prestadas", "ok"))
-        else:
-            colf1, colf2, colf3 = st.columns(3)
-            with colf1:
-                f_prof = st.selectbox("Profesor", ["Todos"] + sorted(activas["nombre"].unique().tolist()))
-            with colf2:
-                f_area = st.selectbox("Área", ["Todos"] + sorted(activas["area"].unique().tolist()))
-            with colf3:
-                f_salon = st.selectbox("Salón", ["Todos"] + sorted(activas["salon"].unique().tolist()))
+            # OJO: r, no row
+            card(
+                f"{r['salon']} — {estado}",
+                f"👤 **{r['nombre']}** · 🏫 {r['area']}  \n"
+                f"🕒 {fh_txt}"
+            )
 
-            if f_prof != "Todos":  activas = activas[activas["nombre"] == f_prof]
-            if f_area != "Todos":  activas = activas[activas["area"] == f_area]
-            if f_salon != "Todos": activas = activas[activas["salon"] == f_salon]
-
-            for idx, row in activas.iterrows():
-                estado = badge("Entregada", "warn")
-                card(
-                    f"Salón {row['salon']} — {estado}",
-                    f"👤 **{row['nombre']}** · 🏫 {row['area']}  \n🕒 {row['fecha_hora'].strftime('%Y-%m-%d %H:%M')}"
+            btn_key = f"dev_{int(r['id']) if pd.notna(r['id']) else hash((r['salon'], fh_txt))}"
+            if st.button(f"Devolver {r['salon']}", key=btn_key):
+                registrar_evento(
+                    r["nombre"],
+                    r["area"],
+                    r["salon"],
+                    "Devuelta",
+                    now_str()
                 )
-                if st.button(f"Devolver {row['salon']}", key=f"dev_{idx}"):
-                    registrar_evento(row["nombre"], row["area"], row["salon"], "Devuelta", now_str())
-                    st.success(f"Llave de {row['salon']} devuelta.")
-                    st.rerun()
+                st.success(f"Llave de {r['salon']} devuelta.")
+                st.rerun()
 
 
 elif menu_key == "historial":
@@ -351,42 +534,36 @@ elif menu_key == "inventario":
     )
 
     # ---------- TAB: AGREGAR ----------
-    with tab_add:
-        with st.form("form_inv_add", clear_on_submit=True):
-            c1, c2, c3 = st.columns(3)
-            with c1:
-                nombre = st.text_input("Nombre del equipo *", placeholder="Osciloscopio, Multímetro…", key="inv_add_nombre")
-                tipo = st.selectbox("Tipo/Categoría *", options=CATEGORIAS_VALIDAS,
-                                    index=CATEGORIAS_VALIDAS.index("Otro"), key="inv_add_tipo")
-            with c2:
-                estado = st.selectbox("Estado *", options=ESTADOS_VALIDOS, key="inv_add_estado")
-                salon  = st.text_input("Salón (código)", placeholder="C3-204 (o BODEGA)", key="inv_add_salon")
-            with c3:
-                responsable = st.text_input("Responsable (opcional)", key="inv_add_resp")
-                placa = st.text_input("Placa (opcional, única para activos de alto valor)", key="inv_add_placa").strip().upper()
-                fecha_registro = now_str()
+    with st.form("form_inv_add", clear_on_submit=True):
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            nombre = st.text_input("Nombre del equipo *")
+            tipo = st.selectbox("Tipo/Categoría *", options=CATEGORIAS_VALIDAS)
+        with c2:
+            estado = st.selectbox("Estado *", options=ESTADOS_VALIDOS)
+            salon = st.text_input("Salón (código)", placeholder="C3-204 (o Bodega)")
+        with c3:
+            responsable = st.text_input("Responsable (opcional)")
+            placa = st.text_input("Placa (opcional)")
+            fecha_registro = now_str()
 
-            if st.form_submit_button("Guardar", type="primary", key="inv_add_submit"):
-                if not nombre.strip():
-                    st.error("El nombre es obligatorio.")
-                else:
-                    tipo_n   = tipo.strip().title()
-                    estado_n = estado.strip()
-                    salon_n  = (salon or "").strip().upper()
-                    placa_n  = placa or None
+                # --- Guardar equipo ---
+        if st.form_submit_button("Guardar", type="primary"):
+            r = agregar_equipo_safe(
+                nombre=nombre,
+                tipo=tipo,
+                estado=estado,
+                salon=salon,
+                responsable=(responsable or ""),
+                fecha_registro=fecha_registro,
+                placa=placa or None
+            )
+            ui_result(r)
+            if r.ok:
+                st.rerun()
 
-                    # Validación de placa (si viene)
-                    if placa_n and existe_placa(placa_n):
-                        st.error(f"La placa {placa_n} ya existe en el inventario.")
-                    else:
-                        if salon_n not in ("", "BODEGA"):
-                            registrar_salon(salon_n)
-                        agregar_equipo(
-                            nombre.strip(), tipo_n, estado_n, salon_n,
-                            (responsable or "").strip(), fecha_registro, placa_n
-                        )
-                        st.success("Equipo agregado.")
-                        st.rerun()
+
+
 
     # ---------- TAB: CARGAR ARCHIVO ----------
     with tab_upload:
@@ -745,11 +922,15 @@ elif menu_key == "stats":
             )
             st.altair_chart(chart5, use_container_width=False)
 
-
 # ========== Inventario por salón ============
 elif menu_key == "inv_salon":
+
+    from database import (
+        obtener_inventario, obtener_salones, registrar_salon,
+        actualizar_equipo, eliminar_equipo, mover_equipo_safe,
+    )
+
     st.header("🏫 Inventario por salón")
-    from database import mover_equipo
 
     # --- Datos base ---
     inv = obtener_inventario()
@@ -757,21 +938,32 @@ elif menu_key == "inv_salon":
         card("Inventario", badge("No hay equipos registrados", "warn"))
         st.stop()
 
-    # Normalización
+    # Normalización (salón vacío -> BODEGA) y asegurar columnas usadas
     df_all = inv.copy()
     df_all["salon"] = df_all["salon"].fillna("").replace("", "BODEGA").str.upper()
+
+    # Asegurar columnas que usamos en filtros/tabla
     if "placa" not in df_all.columns:
         df_all["placa"] = None
+    else:
+        # Normaliza placas vacías -> None para contarlas como consumibles y evitar filtros raros
+        df_all["placa"] = df_all["placa"].replace("", None)
+    if "responsable" not in df_all.columns:
+        df_all["responsable"] = None
 
-    # Salones existentes (rooms + inventario)
+    # Salones disponibles (rooms + inventario)
     try:
         rooms_df = obtener_salones()
         rooms = rooms_df["codigo"].str.upper().tolist() if not rooms_df.empty else []
     except Exception:
         rooms = []
-    salones_disponibles = sorted(set(rooms) | set(df_all["salon"].unique().tolist()))
+    salones_disponibles = sorted(set(rooms) | set(df_all["salon"].dropna().unique().tolist()))
 
-    # Selector salón + creación rápida
+    if not salones_disponibles:
+        card("Salones", badge("No hay salones registrados ni equipos con salón", "warn"))
+        st.stop()
+
+    # Selector de salón + creación rápida
     cA, cB = st.columns([3, 2])
     with cA:
         salon_sel = st.selectbox("Selecciona un salón", salones_disponibles, index=0, key="inv_room_sel")
@@ -798,7 +990,9 @@ elif menu_key == "inv_salon":
     uso  = int((df["estado"] == "En uso").sum())
     dan  = int((df["estado"] == "Dañado").sum())
     ext  = int((df["estado"] == "Extraviado").sum())
+    # consumibles: placa es None
     sin_placa = int(df["placa"].isna().sum())
+
     k1,k2,k3,k4,k5 = st.columns(5)
     k1.metric("Total", total)
     k2.metric("Disponibles", disp)
@@ -819,14 +1013,16 @@ elif menu_key == "inv_salon":
         q = st.text_input("Buscar (placa / nombre / tipo / responsable)", key="inv_room_q")
 
     df_f = df.copy()
-    if f_tipo != "Todos":   df_f = df_f[df_f["tipo"] == f_tipo]
-    if f_estado != "Todos": df_f = df_f[df_f["estado"] == f_estado]
+    if f_tipo != "Todos":
+        df_f = df_f[df_f["tipo"] == f_tipo]
+    if f_estado != "Todos":
+        df_f = df_f[df_f["estado"] == f_estado]
     if q:
         ql = q.lower()
         df_f = df_f[
             df_f["placa"].fillna("").str.lower().str.contains(ql)
-            | df_f["nombre"].str.lower().str.contains(ql)
-            | df_f["tipo"].str.lower().str.contains(ql)
+            | df_f["nombre"].fillna("").str.lower().str.contains(ql)
+            | df_f["tipo"].fillna("").str.lower().str.contains(ql)
             | df_f["responsable"].fillna("").str.lower().str.contains(ql)
         ]
 
@@ -843,43 +1039,52 @@ elif menu_key == "inv_salon":
         key="inv_room_export_csv"
     )
 
-    # Export XLSX
-    import io
-    bio = io.BytesIO()
-    with pd.ExcelWriter(bio, engine="xlsxwriter") as writer:
-        df_f[cols_show].to_excel(writer, index=False, sheet_name=f"{salon_sel}_inventario")
-    st.download_button(
-        "⬇️ Exportar XLSX del salón",
-        data=bio.getvalue(),
-        file_name=f"inventario_{salon_sel}.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        key="inv_room_export_xlsx"
-    )
+    # Export XLSX (opcional, si xlsxwriter está disponible)
+    try:
+        import io
+        bio = io.BytesIO()
+        with pd.ExcelWriter(bio, engine="xlsxwriter") as writer:
+            df_f[cols_show].to_excel(writer, index=False, sheet_name=f"{salon_sel}_inventario")
+        st.download_button(
+            "⬇️ Exportar XLSX del salón",
+            data=bio.getvalue(),
+            file_name=f"inventario_{salon_sel}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key="inv_room_export_xlsx"
+        )
+    except Exception:
+        st.info("Para exportar a XLSX instala `xlsxwriter`. (Se mantiene la descarga CSV).")
 
     st.divider()
 
-    # Acciones en lote
+    # --- Acciones en lote ---
     st.markdown("### ⚙️ Acciones en lote")
     ids_disponibles = df_f["id"].tolist()
     ids_sel = st.multiselect("Selecciona IDs", ids_disponibles, key="inv_room_ids")
 
     cA1, cA2, cA3 = st.columns(3)
+
+    # A) Cambiar estado
     with cA1:
         nuevo_estado = st.selectbox("Cambiar a estado", ["Disponible","En uso","Dañado","Extraviado"], key="inv_room_state")
-        if st.button("Cambiar estado", key="inv_room_change"):
-            if not ids_sel:
-                st.warning("Selecciona al menos un ID.")
-            else:
-                for _id in ids_sel:
-                    actualizar_equipo(int(_id), estado=nuevo_estado)
-                st.success(f"Estado actualizado en {len(ids_sel)} equipo(s).")
-                st.rerun()
+        st.button(
+            "Cambiar estado",
+            key="inv_room_change",
+            disabled=(len(ids_sel) == 0),
+            on_click=lambda: None
+        )
+        if st.session_state.get("inv_room_change"):
+            for _id in ids_sel:
+                actualizar_equipo(int(_id), estado=nuevo_estado)
+            st.success(f"Estado actualizado en {len(ids_sel)} equipo(s).")
+            st.rerun()
 
+# B) Mover + registrar movimiento (trazabilidad)
     with cA2:
-        target = st.text_input("Mover al salón", placeholder="Ej: C3-205", key="inv_room_target").strip().upper()
-        motivo = st.selectbox("Motivo", ["Traslado", "Préstamo", "Mantenimiento", "Auditoría", "Otro"], key="inv_room_motivo")
+        target  = st.text_input("Mover al salón", placeholder="Ej: C3-205", key="inv_room_target").strip().upper()
+        motivo  = st.selectbox("Motivo", ["Traslado", "Préstamo", "Mantenimiento", "Auditoría", "Otro"], key="inv_room_motivo")
         resp_mv = st.text_input("Responsable del movimiento", key="inv_room_resp")
-        notas_mv = st.text_area("Notas (opcional)", key="inv_room_notas", height=70)
+        notas_mv= st.text_area("Notas (opcional)", key="inv_room_notas", height=70)
 
         if st.button("Mover equipo(s)", key="inv_room_move"):
             if not ids_sel:
@@ -887,123 +1092,59 @@ elif menu_key == "inv_salon":
             elif not target:
                 st.warning("Indica el salón destino.")
             else:
-                registrar_salon(target)  # asegura existencia
                 ok, fail = 0, 0
                 for _id in ids_sel:
-                    try:
-                        mover_equipo(
-                            int(_id), target, motivo, resp_mv or "N/A",
-                            fecha_hora=now_str(), notas=notas_mv or None
-                        )
-                        ok += 1
-                    except Exception as e:
-                        fail += 1
+                    r = mover_equipo_safe(
+                        int(_id),
+                        target,
+                        motivo,
+                        (resp_mv or "N/A"),
+                        now_str(),
+                        (notas_mv or None)
+                    )
+                    ok += int(r.ok)
+                    fail += int(not r.ok)
                 st.success(f"Movidos {ok} equipo(s) a {target}. {f'Fallidos: {fail}' if fail else ''}")
                 st.rerun()
 
+
+    # C) Eliminar
     with cA3:
-        if st.button("Eliminar seleccionados", type="secondary", key="inv_room_delete"):
-            if not ids_sel:
-                st.warning("Selecciona al menos un ID.")
-            else:
-                for _id in ids_sel:
-                    eliminar_equipo(int(_id))
-                st.success(f"Eliminados {len(ids_sel)} equipo(s).")
-                st.rerun()
+        delete_disabled = (len(ids_sel) == 0)
+        if st.button("Eliminar seleccionados", type="secondary", key="inv_room_delete", disabled=delete_disabled):
+            for _id in ids_sel:
+                eliminar_equipo(int(_id))
+            st.success(f"Eliminados {len(ids_sel)} equipo(s).")
+            st.rerun()
 
     st.divider()
 
-    # Resumen por tipo (tarjetas)
+    # Resumen por tipo (tarjetas + gráfico)
     st.markdown("### 🧩 Resumen por tipo")
-    g_tipo = (df.groupby("tipo")["id"].count().reset_index().rename(columns={"id":"cantidad"}))
+    g_tipo = (
+        df.groupby("tipo")["id"]
+        .count()
+        .reset_index()
+        .rename(columns={"id":"cantidad"})
+        .sort_values("cantidad", ascending=False)
+    )
     for _, r in g_tipo.iterrows():
         card(f"{r['tipo']}", f"**{int(r['cantidad'])}** equipo(s) en {salon_sel}")
 
-    # Distribución por tipo (gráfico)
-    import altair as alt
-    st.markdown("### 📊 Distribución por tipo")
-    chart = (
-        alt.Chart(g_tipo)
-        .mark_bar()
-        .encode(
-            x=alt.X("tipo:N", title="Tipo de equipo", sort="-y"),
-            y=alt.Y("cantidad:Q", title="Cantidad"),
-            tooltip=["tipo","cantidad"]
+    # Gráfico (opcional)
+    try:
+        import altair as alt
+        st.markdown("### 📊 Distribución por tipo")
+        chart = (
+            alt.Chart(g_tipo)
+            .mark_bar()
+            .encode(
+                x=alt.X("tipo:N", title="Tipo de equipo", sort="-y"),
+                y=alt.Y("cantidad:Q", title="Cantidad"),
+                tooltip=["tipo","cantidad"]
+            )
+            .properties(height=280)
         )
-        .properties(height=280)
-    )
-    st.altair_chart(chart, use_container_width=True)
-
-elif menu_key == "mov_equipos":
-    from database import asegurar_esquema_movimientos, obtener_movimientos, movimientos_por_placa
-    asegurar_esquema_movimientos()
-
-    st.header("🔀 Movimientos de equipos (trazabilidad)")
-    st.caption("Filtra, revisa y exporta el historial de traslados/ajustes de equipos.")
-
-    # Filtros
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        f_placa = st.text_input("Placa (exacta)", key="mov_f_placa").strip().upper()
-    with c2:
-        f_origen = st.text_input("Salón origen", key="mov_f_origen").strip().upper()
-    with c3:
-        f_dest   = st.text_input("Salón destino", key="mov_f_dest").strip().upper()
-
-    c4, c5, c6 = st.columns(3)
-    with c4:
-        f_resp = st.text_input("Responsable (contiene)", key="mov_f_resp")
-    with c5:
-        f_ini  = st.date_input("Desde (fecha)", value=None, key="mov_f_ini")
-    with c6:
-        f_fin  = st.date_input("Hasta (fecha)", value=None, key="mov_f_fin")
-
-    fecha_ini = f_ini.strftime("%Y-%m-%d") if f_ini else None
-    fecha_fin = f_fin.strftime("%Y-%m-%d") if f_fin else None
-
-    dfm = obtener_movimientos(
-        fecha_ini=fecha_ini, fecha_fin=fecha_fin,
-        placa=f_placa or None,
-        salon_origen=f_origen or None,
-        salon_destino=f_dest or None,
-        responsable=f_resp or None
-    )
-
-    st.markdown("### 📋 Resultados")
-    if dfm is None or dfm.empty:
-        card("Movimientos", badge("Sin movimientos con los filtros actuales", "warn"))
-    else:
-        # Orden visual y columnas
-        dfm = dfm[["id","fecha_hora","placa","inventario_id","salon_origen","salon_destino","motivo","responsable","notas"]]
-        st.dataframe(dfm, use_container_width=True, hide_index=True)
-
-        # Export
-        st.download_button(
-            "⬇️ Exportar CSV",
-            dfm.to_csv(index=False).encode("utf-8"),
-            file_name="movimientos_equipos.csv",
-            mime="text/csv",
-            key="mov_export_csv"
-        )
-
-    st.divider()
-
-    # Recorrido por placa (timeline simple)
-    st.markdown("### 🧭 Recorrido por placa")
-    placa_q = st.text_input("Consultar recorrido de la placa", key="mov_rec_placa").strip().upper()
-    if placa_q:
-        line = movimientos_por_placa(placa_q)
-        if line is None or line.empty:
-            card("Recorrido", badge("Sin movimientos registrados para esta placa", "warn"))
-        else:
-            # Orden cronológico
-            line = line.sort_values("fecha_hora")
-            # Mostrar tipo “timeline” textual
-            for _, r in line.iterrows():
-                card(
-                    f"🕒 {r['fecha_hora']} — {r['motivo'] or 'Movimiento'}",
-                    f"🔖 Placa: **{placa_q}**  \n"
-                    f"📦 {r['salon_origen'] or '—'} → **{r['salon_destino']}**  \n"
-                    f"👤 Responsable: {r['responsable'] or 'N/A'}  \n"
-                    f"📝 {r['notas'] or ''}"
-                )
+        st.altair_chart(chart, use_container_width=True)
+    except Exception:
+        pass
