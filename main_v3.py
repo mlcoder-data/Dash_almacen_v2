@@ -212,46 +212,184 @@ if menu_key == "dashboard":
     # --- Dos columnas: Recordatorios  |  Últimos movimientos ---
     col_left, col_right = st.columns([1, 1])
 
-    # 1) Recordatorios (izquierda)
-    with col_left:
-        st.markdown("### 🔔 Recordatorios")
-        alertas = []
-        if hist is not None and not hist.empty:
-            df = procesar_fechas(hist)
-            ult = df.sort_values("fecha_hora").groupby("salon").tail(1)
-            vencidas = ult[
-                (ult["accion"] == "Entregada")
-                & ((pd.Timestamp.now() - ult["fecha_hora"]) > pd.Timedelta(hours=2))
-            ]
-            if not vencidas.empty:
-                for _, r in vencidas.iterrows():
-                    card(
-                        "Devolución pendiente",
-                        f"⚠️ **{r['salon']}** entregada a **{r['nombre']}** · {r['area']}  \n"
-                        f"🕒 {r['fecha_hora'].strftime('%Y-%m-%d %H:%M')}"
-                    )
-            else:
-                card("Estado", badge("No hay recordatorios por ahora", "ok"))
-        else:
-            card("Estado", badge("Aún no hay movimientos", "warn"))
+    # --- RECORDATORIOS (colaborativos) ---
+    from database import (
+        asegurar_esquema_recordatorios,
+        agregar_recordatorio,
+        obtener_recordatorios,
+        marcar_recordatorio,
+        eliminar_recordatorio,
+    )
+    asegurar_esquema_recordatorios()
 
-    # 2) Últimos movimientos (derecha)
-    with col_right:
-        st.markdown("### 🕓 Últimos movimientos")
-        if hist is not None and not hist.empty:
-            df_last = procesar_fechas(hist).sort_values("fecha_hora", ascending=False).head(6)
-            for _, r in df_last.iterrows():
-                icon = "🔑" if r["accion"] == "Entregada" else "✅"
-                color = "warn" if r["accion"] == "Entregada" else "ok"
-                card(
-                    f"{icon} {r['accion']} — {r['salon']}",
-                    f"👤 **{r['nombre']}** · 🏫 {r['area']}  \n"
-                    f"{badge(r['accion'], color)} · 🕒 {r['fecha_hora'].strftime('%Y-%m-%d %H:%M')}"
+    st.markdown("### 🔔 Recordatorios !!! ")
+
+    # --- Formulario para agregar nuevo recordatorio ---
+    with st.form("form_recordatorio", clear_on_submit=True):
+        c1, c2, c3 = st.columns([3, 1, 1])
+        with c1:
+            texto = st.text_input("Nuevo recordatorio o tarea", placeholder="Ej: Revisar equipos de Sala 305-F")
+        with c2:
+            fecha = st.date_input("Fecha (opcional)")
+        with c3:
+            responsable = st.text_input("Responsable", placeholder="Ej: Mateo o ADSO")
+
+        if st.form_submit_button("➕ Agregar recordatorio"):
+            if texto.strip():
+                agregar_recordatorio(
+                    texto,
+                    fecha.strftime("%Y-%m-%d") if fecha else None,
+                    responsable or None
                 )
-        else:
-            card("Últimos movimientos", badge("Sin registros", "ok"))
+                st.success("Recordatorio agregado ✅")
+                st.rerun()
+            else:
+                st.warning("Escribe una tarea o recordatorio antes de guardar.")
 
-    st.divider()
+    # --- Mostrar lista de recordatorios existentes ---
+    df_rec = obtener_recordatorios()
+
+    if df_rec.empty:
+        st.info("No hay recordatorios por ahora.")
+    else:
+        for _, r in df_rec.iterrows():
+            cols = st.columns([0.55, 0.15, 0.15, 0.15])
+            texto = r["texto"]
+            fecha = r["fecha"] or ""
+            resp = r["responsable"] or ""
+            hecho = bool(r["hecho"])
+
+            with cols[0]:
+                msg = f"**{texto}**"
+                if fecha:
+                    msg += f"  \n📅 {fecha}"
+                if resp:
+                    msg += f"  \n👤 {resp}"
+                if hecho:
+                    st.markdown(f"✅ ~~{msg}~~")
+                else:
+                    st.markdown(msg)
+
+            with cols[1]:
+                if st.button("✅ Hecho" if not hecho else "↩️ Pendiente", key=f"done_{r['id']}"):
+                    marcar_recordatorio(int(r["id"]), not hecho)
+                    st.rerun()
+
+            with cols[2]:
+                if st.button("🗑️ Eliminar", key=f"del_{r['id']}"):
+                    eliminar_recordatorio(int(r["id"]))
+                    st.rerun()
+
+    import datetime
+
+    # 🔍 Fecha actual
+    hoy = datetime.date.today()
+
+    # 🔎 Filtrar recordatorios pendientes con fecha
+    pendientes = df_rec[(df_rec["hecho"] == 0) & (df_rec["fecha"].notna())]
+
+    # ⚠️ Recordatorios vencidos o del día actual
+    vencidos = pendientes[pendientes["fecha"].apply(lambda d: datetime.date.fromisoformat(d) <= hoy)]
+
+    # 🔔 Mostrar alerta si hay recordatorios urgentes
+    if not vencidos.empty:
+        st.warning(f"⚠️ {len(vencidos)} recordatorio(s) con fecha vencida o para hoy.")
+
+
+    # 2) Últimos movimientos
+    # === 🕓 Últimos movimientos (centrado y color dinámico) ===
+    st.markdown("## 🕓 Últimos movimientos recientes")
+    st.write("")  # espacio visual
+
+    if hist is None or hist.empty:
+        st.info("No hay registros recientes.")
+    else:
+        import datetime as _dt
+        import pandas as pd
+
+        def rel_time(ts):
+            """Convierte fecha a formato relativo legible."""
+            if ts is None or not isinstance(ts, _dt.datetime):
+                return ""
+            now = _dt.datetime.now()
+            delta = now - ts
+            s = delta.total_seconds()
+            if s < 60:
+                return "hace segundos"
+            elif s < 3600:
+                return f"hace {int(s//60)} min"
+            elif s < 86400:
+                return f"hace {int(s//3600)} h"
+            elif s < 172800:
+                return "ayer"
+            else:
+                return f"hace {int(s//86400)} días"
+
+        # Mostrar más registros si el usuario lo desea
+        ver_mas = st.toggle("Ver más movimientos", value=False, key="dash_movs_toggle")
+        topn = 20 if ver_mas else 6
+
+        df_last = (
+            procesar_fechas(hist)
+            .sort_values("fecha_hora", ascending=False)
+            .head(topn)
+            .copy()
+        )
+
+        # CSS personalizado para animación y colores dinámicos
+        st.markdown("""
+        <style>
+        .mov-card {
+            border-radius: 14px;
+            padding: 16px 20px;
+            margin: 14px auto;
+            max-width: 700px;
+            color: #fff;
+            animation: fadeIn 0.7s ease-in-out;
+            box-shadow: 0 3px 10px rgba(0,0,0,0.3);
+            transition: transform 0.2s ease;
+        }
+        .mov-card:hover { transform: scale(1.01); }
+        .mov-entregada { background: linear-gradient(135deg, #f9d976, #f39c12); }
+        .mov-devuelta  { background: linear-gradient(135deg, #76d7c4, #27ae60); }
+        @keyframes fadeIn {
+            from { opacity: 0; transform: translateY(10px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+        .mov-title {
+            font-size: 20px;
+            margin: 0 0 8px 0;
+            font-weight: 600;
+        }
+        .mov-meta {
+            font-size: 15px;
+            color: #f4f4f4;
+            margin-top: 4px;
+            line-height: 1.5;
+        }
+        </style>
+        """, unsafe_allow_html=True)
+
+        # Render tarjetas centradas
+        st.markdown("<div style='text-align:center;'>", unsafe_allow_html=True)
+        for _, r in df_last.iterrows():
+            icon = "🔑" if r["accion"] == "Entregada" else "✅"
+            clase_color = "mov-entregada" if r["accion"] == "Entregada" else "mov-devuelta"
+            fh_txt = r["fecha_hora"].strftime("%Y-%m-%d %H:%M") if pd.notna(r["fecha_hora"]) else "—"
+            tiempo = rel_time(r["fecha_hora"])
+
+            st.markdown(f"""
+            <div class="mov-card {clase_color}">
+                <div class="mov-title">{icon} {r['accion']} — <b>{r['salon']}</b></div>
+                <div class="mov-meta">
+                    👤 <b>{r['nombre']}</b> · 🏫 {r['area']} <br>
+                    🕒 {fh_txt} · {tiempo}
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
+        st.markdown("</div>", unsafe_allow_html=True)
+
+# ----------- --------- ---------------------
 
     # --- Actividad (7 días) ---
     st.markdown("### 📅 Actividad (últimos 7 días)")
@@ -304,6 +442,7 @@ if menu_key == "dashboard":
     #         )
     #         st.altair_chart(chart2, use_container_width=True)
 
+# -------------------------------------------------------------------------------------
 
 elif menu_key == "registrar":
     from validators import (
@@ -320,6 +459,7 @@ elif menu_key == "registrar":
         "Completa los campos y registra **Entregada** o **Devuelta**.  \n"
         + badge("Una llave no puede entregarse dos veces seguidas", "warn")
     )
+
 
     # Fuente de programas (permite que crezcan por sesión)
     if "programas" not in st.session_state:

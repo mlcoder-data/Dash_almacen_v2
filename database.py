@@ -586,3 +586,56 @@ def run_startup_migrations():
             conn.commit()
     finally:
         conn.close()
+
+# =======================================================
+#  📌 SECCIÓN: RECORDATORIOS (dashboard colaborativo)
+# =======================================================
+ESQUEMA_RECORDATORIOS = """
+CREATE TABLE IF NOT EXISTS recordatorios (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    texto TEXT NOT NULL,
+    fecha TEXT,
+    responsable TEXT,
+    hecho INTEGER DEFAULT 0  -- 0 = pendiente, 1 = completado
+);
+"""
+
+def asegurar_esquema_recordatorios():
+    conn = obtener_conexion()
+    conn.executescript(ESQUEMA_RECORDATORIOS)
+    conn.commit()
+    conn.close()
+
+
+def agregar_recordatorio(texto, fecha=None, responsable=None):
+    conn = obtener_conexion()
+    conn.execute(
+        "INSERT INTO recordatorios (texto, fecha, responsable) VALUES (?, ?, ?)",
+        (texto.strip(), fecha, responsable)
+    )
+    conn.commit()
+    conn.close()
+
+
+def obtener_recordatorios(incluir_hechos=True):
+    conn = obtener_conexion()
+    query = "SELECT * FROM recordatorios"
+    if not incluir_hechos:
+        query += " WHERE hecho = 0"
+    df = pd.read_sql_query(query + " ORDER BY COALESCE(fecha, datetime('now')) ASC", conn)
+    conn.close()
+    return df
+
+
+def marcar_recordatorio(id_record, hecho=True):
+    conn = obtener_conexion()
+    conn.execute("UPDATE recordatorios SET hecho = ? WHERE id = ?", (1 if hecho else 0, id_record))
+    conn.commit()
+    conn.close()
+
+
+def eliminar_recordatorio(id_record):
+    conn = obtener_conexion()
+    conn.execute("DELETE FROM recordatorios WHERE id = ?", (id_record,))
+    conn.commit()
+    conn.close()
